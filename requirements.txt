@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+scikit-learn
+sentence-transformers
+tqdm
+openai>=1.0.0
+matplotlib
+seaborn
