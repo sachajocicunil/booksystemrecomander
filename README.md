@@ -225,7 +225,9 @@ python src/EnrichissementChatGPT.py
 ## 10) Licence & Crédits
 
 - Code des modèles inspiré de méthodes classiques (TF‑IDF, EASE, SVD) et de l’encodeur `sentence-transformers`.
-- Auteur: Projet local utilisateur; ce README a été généré pour documenter l’implémentation et faciliter la prise en main.
+- Auteur: Sacha Jocic,Léa Jouffrey, Saloua Dekhissi
+
+Ce README a été créé pour documenter l’implémentation et faciliter la prise en main.
 
 
 ---
@@ -348,3 +350,65 @@ Cette section précise exactement ce que réalise la version finale livrée du m
 - Notes pratiques:
   - L’option `ensemble_weights=[0.6, 0.4]` a montré un meilleur score local mais a dégradé le score Kaggle public, indiquant un sur‑apprentissage au split de validation — elle est donc laissée en commentaire dans le notebook.
   - Pour la génération de soumission (`03_Main_Model_Submission_File_Generator.ipynb`), la même configuration est utilisée sur l’ensemble des données (entraînement intégral), avec fallback « items populaires » pour les utilisateurs cold‑start.
+
+
+---
+
+## 15) Application Streamlit — Démonstrateur pour Bibliothécaire
+
+Cette application autonome permet d’explorer le catalogue et de générer des recommandations avec le modèle final (`SemanticHybridRecommender`). Elle vise un usage « pratico‑pratique » par un/une bibliothécaire.
+
+### 15.1 Installation & Lancement
+- Prérequis: dépendances déjà listées dans `requirements.txt` (inclut `streamlit`).
+- Installation (si besoin):
+  ```
+  pip install -r requirements.txt
+  ```
+- Lancer l’application depuis la racine du dépôt:
+  ```
+  streamlit run app/streamlit_app.py
+  ```
+- Par défaut, l’app cherchera les fichiers:
+  - `data/interactions_train.csv`
+  - `data/items_enriched_ai_turbo.csv` (si présent) ou `data/items.csv`
+
+Astuce: les chemins des CSV sont modifiables dans la barre latérale.
+
+### 15.2 Fonctionnalités principales
+- Overview
+  - Statistiques rapides (utilisateurs, items, interactions)
+  - Recherche rapide par titre/auteur/sujet
+- Recommend for Patron (utilisateur connu)
+  - Sélection d’un `user_id` et génération du Top‑K
+  - Règles « métier » optionnelles: exclure déjà‑lus, limiter à N livres par auteur
+  - Export CSV des recommandations et recueil de feedback (like) journalisé dans `data/feedback_log.csv`
+- Cold‑Start (Text Search)
+  - Recommandations à partir d’une description libre (mots‑clés, auteur, genre)
+  - Utilise l’encodeur sémantique S‑BERT
+- Similar Books (item‑item)
+  - Trouver des livres similaires à un livre choisi (voisinage sémantique/collaboratif)
+- Analytics
+  - Auteurs les plus consultés (bar chart), popularité, histogrammes de récence
+- Settings
+  - Visualisation des chemins de données, génération d’un CSV de soumission d’exemple (aperçu)
+
+### 15.3 Paramètres du modèle (barre latérale)
+- `alpha` (collaboratif vs contenu), `half_life_days` (séparés par des virgules), `Top‑K`
+- Bouton « Rebuild model (fit) » pour refitter avec les nouveaux paramètres
+- Bouton « Clear caches » pour réinitialiser les caches Streamlit
+
+Valeurs par défaut: `alpha=0.5`, `half_life_days=[1, 250]`, `k=10`, cohérentes avec la version finale documentée.
+
+### 15.4 Performance & Caching
+- Le premier lancement peut être long (téléchargement du modèle S‑BERT et encodage des items)
+- Des caches (`st.cache_data`/`st.cache_resource`) évitent les recomputations coûteuses
+- Un GPU n’est pas requis mais accélère S‑BERT si disponible
+
+### 15.5 Dépannage
+- « sentence‑transformers introuvable »: installez via `pip install -r requirements.txt`
+- Colonne manquante dans `items.csv`: l’app tolère l’absence de `Author`/`Subjects` (remplacement par chaîne vide), mais la qualité sémantique est meilleure avec ces colonnes
+- Mémoire: si le catalogue est très grand, envisagez de réduire temporairement `Top‑K` et de vérifier que `items.csv` ne contient pas de colonnes excessives
+
+### 15.6 Sécurité & Données
+- L’app lit uniquement des CSV locaux; aucun envoi de données n’est réalisé
+- Les feedbacks sont stockés en local dans `data/feedback_log.csv`

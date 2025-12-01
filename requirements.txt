@@ -7,3 +7,5 @@ tqdm
 openai>=1.0.0
 matplotlib
 seaborn
+streamlit
+plotly
