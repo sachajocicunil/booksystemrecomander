@@ -5,6 +5,7 @@ import numpy as np
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfTransformer, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity, linear_kernel
+from sklearn.preprocessing import normalize
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -12,16 +13,15 @@ except ImportError:
     raise ImportError("Install sentence-transformers: pip install sentence-transformers")
 
 from .base import BaseRecommender
+from .svd import SVDRecommender
 
 
 class SemanticHybridRecommender(BaseRecommender):
     """
     MEILLEUR MODÈLE (Production) - Version "Decoupled Re-buy".
-
-    Correction Critique :
-    L'Ensemble pondéré diluait le signal de "Re-buy" des vieux items (car le modèle court terme les oublie).
-    Cette version applique le boost de Re-buy UNIQUEMENT sur l'historique le plus long,
-    tout en utilisant l'ensemble court/long pour la similarité.
+    + BM25 (Keywords)
+    + SVD (Latent Factors)
+    + Sequential (Next-Item Co-visitation)
     """
 
     def __init__(self, n_users, n_items):
@@ -33,24 +33,15 @@ class SemanticHybridRecommender(BaseRecommender):
         # Ensemble
         self.ensemble_models = []
         self.pop_scores = None
-        self.long_term_user_matrix = None  # Stocke l'historique le plus complet
+        self.long_term_user_matrix = None
+        self.sim_bm25 = None
+        self.svd_model = None
+        self.transition_matrix = None
+        self.short_term_user_matrix = None
 
     def fit(self, df_interactions, df_items, alpha=0.5, half_life_days=[1, 250], ensemble_weights=[0.5, 0.5]):
         """
-        Entraîne le modèle hybride décorrélé pour le re-buy.
-
-        Paramètres
-        ----------
-        df_interactions : pd.DataFrame
-            Interactions avec colonnes `u_idx`, `i_idx`, `t`. Peut contenir des duplicats/poids, ici pondérés par time-decay.
-        df_items : pd.DataFrame
-            Métadonnées items alignées (incluant `i_idx`) avec colonnes textuelles `Title`, `Author`, `Subjects`.
-        alpha : float in [0,1]
-            Poids de la composante collaborative vs sémantique (alpha*collab + (1-alpha)*content).
-        half_life_days : int | list[int]
-            Une ou plusieurs demi‑vies (en jours) pour construire des sous‑modèles pondérés par récence.
-        ensemble_weights : list[float] | None
-            Poids de chaque sous‑modèle dans l’agrégation. Par défaut: uniforme.
+        Entraîne le modèle hybride complet (S-BERT + BM25 + SVD + Sequential).
         """
         if isinstance(half_life_days, (int, float)):
             half_life_days = [half_life_days]
@@ -61,6 +52,15 @@ class SemanticHybridRecommender(BaseRecommender):
         if len(ensemble_weights) != len(half_life_days):
             print(f"⚠️ Warning: Weights len != Half-lives len. Using equal weights.")
             ensemble_weights = [1.0 / len(half_life_days)] * len(half_life_days)
+
+        # --- 0. SVD (Latent Factors) ---
+        print("\nFitting SVD Component...")
+        self.svd_model = SVDRecommender(self.n_users, self.n_items, n_factors=100)
+        self.svd_model.fit(df_interactions)
+        # Normalisation pour Cosine Similarity (-1 à 1)
+        self.svd_model.user_vecs = normalize(self.svd_model.user_vecs, axis=1)
+        self.svd_model.item_vecs = normalize(self.svd_model.item_vecs.T, axis=1).T
+        print("SVD Component Ready.")
 
         print(f"Fitting SemanticHybrid Decoupled | Alpha={alpha}, HL={half_life_days}, Weights={ensemble_weights}...")
 
@@ -128,7 +128,7 @@ class SemanticHybridRecommender(BaseRecommender):
         self.ensemble_models = []
         max_hl = -1
         min_hl = float('inf')
-        short_term_user_matrix = None
+        self.short_term_user_matrix = None
 
         for idx, hl in enumerate(half_life_days):
             print(f"\n--- Building Sub-Model {idx + 1} (Half-life={hl}d) ---")
@@ -167,6 +167,11 @@ class SemanticHybridRecommender(BaseRecommender):
             if hl > max_hl:
                 max_hl = hl
                 self.long_term_user_matrix = user_profile
+            
+            # On repère l'historique le plus court (pour le Séquentiel)
+            if hl < min_hl:
+                min_hl = hl
+                self.short_term_user_matrix = user_profile
 
             # Compatibilité
             self.train_matrix_tfidf = user_profile
@@ -178,9 +183,30 @@ class SemanticHybridRecommender(BaseRecommender):
         item_popularity = np.array(self.long_term_user_matrix.sum(axis=0)).flatten()
         self.pop_scores = item_popularity / item_popularity.max() if item_popularity.max() > 0 else item_popularity
 
+        # --- 4. SEQUENTIAL / CO-VISITATION ---
+        print("Computing Sequential Transition Matrix...")
+        df_sorted = df_interactions.sort_values(['u_idx', 't'])
+        # Create Next Item column
+        df_sorted['next_i'] = df_sorted.groupby('u_idx')['i_idx'].shift(-1)
+        # Drop last item of each user (NaN)
+        df_seq = df_sorted.dropna(subset=['next_i'])
+        
+        # Count transitions
+        transitions = df_seq.groupby(['i_idx', 'next_i']).size().reset_index(name='count')
+        
+        # Log count (safer)
+        transitions['score'] = np.log1p(transitions['count'])
+        
+        # Build Sparse Matrix (Item x Item)
+        row = transitions['i_idx'].values
+        col = transitions['next_i'].values.astype(int)
+        data = transitions['score'].values
+        
+        self.transition_matrix = sparse.csr_matrix((data, (row, col)), shape=(self.n_items, self.n_items))
+
         print("Ensemble Model Fitted Successfully.")
 
-    def predict(self, k=10, batch_size=1000, re_buy_factor=0.5, pop_factor=0.2, bm25_weight=0.15):
+    def predict(self, k=10, batch_size=1000, re_buy_factor=0.5, pop_factor=0.2, bm25_weight=0.15, svd_weight=0.15, seq_weight=0.3):
         predictions = []
 
         for start_idx in range(0, self.n_users, batch_size):
@@ -194,7 +220,7 @@ class SemanticHybridRecommender(BaseRecommender):
                 sim_matrix = model['item_matrix']
                 weight = model['weight']
 
-                # Score = User * Sim (Attention: Sim n'a PAS de boost diagonal ici)
+                # Score = User * Sim
                 scores = user_batch.dot(sim_matrix)
 
                 if sparse.issparse(scores): scores = scores.toarray()
@@ -205,26 +231,37 @@ class SemanticHybridRecommender(BaseRecommender):
                 else:
                     final_batch_scores += scores * weight
 
-            # 2. Ajout du Re-Buy Boost (Exploitation)
-            # On prend l'historique LONG TERME pour ne pas oublier les vieux items
-            # On ajoute re_buy_factor * Historique à la fin
+            # 2. Ajout SVD (Latent Factors)
+            if self.svd_model is not None:
+                scores_svd = self.svd_model.get_scores_batch(start_idx, end_idx)
+                # Rescale [-1, 1] -> [0, 1] approx pour matcher Cosine
+                scores_svd = (scores_svd + 1) / 2
+                final_batch_scores += (scores_svd * svd_weight)
+
+            # 3. Ajout du Re-Buy Boost (Exploitation)
             long_term_batch = self.long_term_user_matrix[start_idx:end_idx]
             if sparse.issparse(long_term_batch):
                 long_term_batch = long_term_batch.toarray()
 
-            # Le facteur re_buy_factor correspond à ton boost diagonal précédent
             final_batch_scores += (re_buy_factor * long_term_batch)
 
-            # 3. Boost Popularité
+            # 4. Boost Popularité
             if self.pop_scores is not None:
                 final_batch_scores += (pop_factor * self.pop_scores.reshape(1, -1))
             
-            # 4. Boost BM25 (Keyword Matching)
+            # 5. Boost BM25 (Keyword Matching)
             if self.sim_bm25 is not None:
-                # On utilise l'historique long terme pour matcher les keywords
                 scores_bm25 = long_term_batch.dot(self.sim_bm25)
                 if sparse.issparse(scores_bm25): scores_bm25 = scores_bm25.toarray()
                 final_batch_scores += (bm25_weight * scores_bm25)
+
+            # 6. Boost Sequential (Next Item Prediction)
+            if self.transition_matrix is not None and self.short_term_user_matrix is not None:
+                # On utilise le profil court terme (HL=1) pour prédire la suite immédiate
+                last_items = self.short_term_user_matrix[start_idx:end_idx]
+                seq_scores = last_items.dot(self.transition_matrix)
+                if sparse.issparse(seq_scores): seq_scores = seq_scores.toarray()
+                final_batch_scores += (seq_weight * seq_scores)
 
             # Sélection Top K
             top_k_unsorted = np.argpartition(final_batch_scores, -k, axis=1)[:, -k:]
@@ -239,39 +276,3 @@ class SemanticHybridRecommender(BaseRecommender):
             predictions.extend(batch_preds)
 
         return np.array(predictions)
-
-    def get_batch_scores(self, start_idx, end_idx, re_buy_factor=0.5, pop_factor=0.2):
-        """
-        Retourne la matrice de scores denses pour un batch d'utilisateurs.
-        Utilisé pour l'Ensembling.
-        """
-        # 1. Calcul des scores de similarité (Exploration)
-        final_batch_scores = None
-
-        for model in self.ensemble_models:
-            user_batch = model['user_matrix'][start_idx:end_idx]
-            sim_matrix = model['item_matrix']
-            weight = model['weight']
-
-            scores = user_batch.dot(sim_matrix)
-
-            if sparse.issparse(scores): scores = scores.toarray()
-            scores = np.asarray(scores)
-
-            if final_batch_scores is None:
-                final_batch_scores = scores * weight
-            else:
-                final_batch_scores += scores * weight
-
-        # 2. Ajout du Re-Buy Boost
-        long_term_batch = self.long_term_user_matrix[start_idx:end_idx]
-        if sparse.issparse(long_term_batch):
-            long_term_batch = long_term_batch.toarray()
-
-        final_batch_scores += (re_buy_factor * long_term_batch)
-
-        # 3. Boost Popularité
-        if self.pop_scores is not None:
-            final_batch_scores += (pop_factor * self.pop_scores.reshape(1, -1))
-            
-        return final_batch_scores

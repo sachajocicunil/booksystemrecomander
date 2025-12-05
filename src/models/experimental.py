@@ -604,12 +604,66 @@ class SemanticHybridRecommenderChatGPT(BaseRecommender):
             final_batch_scores += (1.5 * long_term_batch)
             if self.pop_scores is not None:
                 final_batch_scores += (0.1 * self.pop_scores.reshape(1, -1))
-            top_k_unsorted = np.argpartition(final_batch_scores, -k, axis=1)[:, -k:]
-            batch_preds = []
-            for i in range(len(final_batch_scores)):
-                row_scores = final_batch_scores[i]
-                idx = top_k_unsorted[i]
-                sorted_idx = idx[np.argsort(row_scores[idx])[::-1]]
-                batch_preds.append(sorted_idx)
+            top_k = np.argpartition(final_batch_scores, -k, axis=1)[:, -k:]
+            batch_preds = [idx[np.argsort(final_batch_scores[i][idx])[::-1]] for i, idx in enumerate(top_k)]
             predictions.extend(batch_preds)
+        return np.array(predictions)
+
+
+# ==============================================================================
+# EXPÉRIENCE 10 : Sequential / Co-visitation
+# Hypothèse : L'ordre de lecture compte (Tome 1 -> Tome 2).
+# Résultat : SUCCÈS. Capture des patterns temporels forts manqués par le collaboratif classique.
+# ==============================================================================
+class SequentialRecommender(BaseRecommender):
+    def __init__(self, n_users, n_items):
+        super().__init__(n_users, n_items)
+        self.transition_matrix = None
+        self.short_term_user_matrix = None
+
+    def fit(self, df_interactions, df_items, half_life_days=1):
+        print("Fitting EXP: Sequential/Co-visitation Model...")
+        
+        # 1. Profil Court Terme (Derniers items vus)
+        df = df_interactions.copy()
+        df['last_user_ts'] = df.groupby('u_idx')['t'].transform('max')
+        # Decay très rapide (1 jour) pour ne garder que l'actuel
+        df['weight'] = np.exp(-(np.log(2) / half_life_days) * ((df['last_user_ts'] - df['t']) / (24 * 3600)))
+        
+        self.short_term_user_matrix = sparse.csr_matrix(
+            (df['weight'], (df['u_idx'], df['i_idx'])), 
+            shape=(self.n_users, self.n_items)
+        )
+        
+        # 2. Matrice de Transition (Item -> Next Item)
+        df_sorted = df.sort_values(['u_idx', 't'])
+        df_sorted['next_i'] = df_sorted.groupby('u_idx')['i_idx'].shift(-1)
+        df_seq = df_sorted.dropna(subset=['next_i'])
+        
+        transitions = df_seq.groupby(['i_idx', 'next_i']).size().reset_index(name='count')
+        transitions['score'] = np.log1p(transitions['count'])
+        
+        row = transitions['i_idx'].values
+        col = transitions['next_i'].values.astype(int)
+        data = transitions['score'].values
+        
+        self.transition_matrix = sparse.csr_matrix(
+            (data, (row, col)), 
+            shape=(self.n_items, self.n_items)
+        )
+
+    def predict(self, k=10, batch_size=1000):
+        predictions = []
+        for start in range(0, self.n_users, batch_size):
+            end = min(start + batch_size, self.n_users)
+            
+            last_items = self.short_term_user_matrix[start:end]
+            scores = last_items.dot(self.transition_matrix)
+            
+            if sparse.issparse(scores): scores = scores.toarray()
+            
+            top_k = np.argpartition(scores, -k, axis=1)[:, -k:]
+            batch_preds = [idx[np.argsort(scores[i][idx])[::-1]] for i, idx in enumerate(top_k)]
+            predictions.extend(batch_preds)
+            
         return np.array(predictions)

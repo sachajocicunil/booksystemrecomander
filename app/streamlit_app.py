@@ -1,13 +1,21 @@
+"""
+📚 BiblioRec — Système de Recommandation Intelligent pour Bibliothèques
+Application Streamlit pour démontrer le modèle Super-Ensemble
+"""
+
 import os
 import io
 import json
 import time
 import hashlib
-from typing import List, Tuple, Optional
+from typing import List, Tuple
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 from scipy import sparse
 
 # Project imports
@@ -17,450 +25,727 @@ sys.path.append(PROJECT_ROOT)
 
 from src.preprocessing import DataLoader
 from src.models import SemanticHybridRecommender
-from src.metrics import mapk_score
 
 try:
     from sentence_transformers import SentenceTransformer
-    from sklearn.metrics.pairwise import cosine_similarity
-except Exception as e:
-    st.warning("sentence-transformers is required for semantic features. Install via requirements.txt")
+except ImportError:
+    SentenceTransformer = None
 
-APP_TITLE = "Library Recommender — Semantic Hybrid"
-DATA_DIR_DEFAULT = os.path.join(PROJECT_ROOT, 'data')
-SUBMISSION_DIR_DEFAULT = os.path.join(PROJECT_ROOT, 'submission')
-FEEDBACK_LOG = os.path.join(DATA_DIR_DEFAULT, 'feedback_log.csv')
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+APP_TITLE = "📚 BiblioRec — Recommandations Intelligentes"
+APP_ICON = "📚"
+DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+FEEDBACK_LOG = os.path.join(DATA_DIR, 'feedback_log.csv')
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
+# Page config
+st.set_page_config(
+    page_title="BiblioRec",
+    page_icon=APP_ICON,
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# -----------------------------
-# Caching helpers
-# -----------------------------
+# Custom CSS pour un look moderne
+st.markdown("""
+<style>
+    /* Header gradient */
+    .main-header {
+        background: linear-gradient(90deg, #1e3a5f 0%, #2d5a87 100%);
+        padding: 1.5rem 2rem;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+        color: white;
+    }
+    .main-header h1 {
+        margin: 0;
+        font-size: 2rem;
+    }
+    .main-header p {
+        margin: 0.5rem 0 0 0;
+        opacity: 0.9;
+    }
+    
+    /* Metric cards */
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1.5rem;
+        border-radius: 12px;
+        color: white;
+        text-align: center;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+    }
+    .metric-card h3 {
+        margin: 0;
+        font-size: 2.5rem;
+        font-weight: bold;
+    }
+    .metric-card p {
+        margin: 0.5rem 0 0 0;
+        opacity: 0.9;
+        font-size: 0.9rem;
+    }
+    
+    /* Book cards */
+    .book-card {
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .book-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }
+    .book-title {
+        font-weight: bold;
+        color: #1e3a5f;
+        font-size: 1.1rem;
+    }
+    .book-author {
+        color: #666;
+        font-style: italic;
+    }
+    .book-reason {
+        background: #f0f7ff;
+        padding: 0.5rem;
+        border-radius: 5px;
+        font-size: 0.85rem;
+        margin-top: 0.5rem;
+        color: #2d5a87;
+    }
+    
+    /* Tabs styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        padding: 10px 20px;
+        border-radius: 8px 8px 0 0;
+    }
+    
+    /* Success/Info boxes */
+    .info-box {
+        background: 48913A;
+        border-left: 4px solid #2196F3;
+        padding: 1rem;
+        border-radius: 0 8px 8px 0;
+        margin: 1rem 0;
+    }
+    
+    /* Hide Streamlit branding */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+# =============================================================================
+# CACHING FUNCTIONS
+# =============================================================================
 @st.cache_data(show_spinner=False)
-def load_data(path_interactions: str, path_items: str) -> Tuple[DataLoader, pd.DataFrame, pd.DataFrame]:
+def load_data(path_interactions: str, path_items: str):
     loader = DataLoader(path_interactions, path_items)
     return loader, loader.interactions, loader.items_df
 
 @st.cache_resource(show_spinner=True)
-def build_model_cached(interactions: pd.DataFrame,
-                       items_df: pd.DataFrame,
-                       n_users: int,
-                       n_items: int,
-                       alpha: float,
-                       half_life_days: List[int],
-                       ensemble_weights: List[float] | None) -> SemanticHybridRecommender:
+def build_model(interactions, items_df, n_users, n_items, alpha, half_life_days):
     model = SemanticHybridRecommender(n_users=n_users, n_items=n_items)
-    model.fit(interactions, items_df, alpha=alpha, half_life_days=half_life_days, ensemble_weights=ensemble_weights)
+    model.fit(interactions, items_df, alpha=alpha, half_life_days=half_life_days)
     return model
 
 @st.cache_resource(show_spinner=False)
-def load_bert() -> SentenceTransformer:
+def load_bert():
+    if SentenceTransformer is None:
+        return None
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 @st.cache_data(show_spinner=False)
-def compute_item_embeddings(items_df: pd.DataFrame, use_disk_cache: bool = True) -> np.ndarray:
-    """Compute or load cached S-BERT item embeddings (sorted by i_idx).
-    If use_disk_cache=True, saves/loads .npy from data/cache with a content hash.
-    """
-    model_name = 'all-MiniLM-L6-v2'
+def compute_embeddings(items_df):
     model_bert = load_bert()
-    df_items_sorted = items_df.sort_values('i_idx').fillna('')
-    # Build texts and hash
+    if model_bert is None:
+        return None
+    
+    df_sorted = items_df.sort_values('i_idx').fillna('')
+    texts = (df_sorted['Title'] + ". " + df_sorted['Author'].fillna('') + ". " + df_sorted['Subjects'].fillna('')).tolist()
+    
+    # Check cache
     hasher = hashlib.md5()
-    texts = []
-    for _, row in df_items_sorted[['Title', 'Author', 'Subjects']].fillna('').iterrows():
-        t = f"{row.get('Title','')}. {row.get('Author','')}. {row.get('Subjects','')}"
-        texts.append(t)
+    for t in texts:
         hasher.update(t.encode('utf-8', errors='ignore'))
-    key = hasher.hexdigest()
-
+    cache_key = hasher.hexdigest()
+    
     cache_dir = os.path.join(PROJECT_ROOT, 'data', 'cache')
     os.makedirs(cache_dir, exist_ok=True)
-    base = f"embeddings_{model_name}_{key}".replace('/', '_')
-    path_npy = os.path.join(cache_dir, base + '.npy')
-    path_meta = os.path.join(cache_dir, base + '.json')
-
-    if use_disk_cache and os.path.exists(path_npy) and os.path.exists(path_meta):
-        try:
-            with open(path_meta, 'r') as f:
-                meta = json.load(f)
-            if meta.get('model') == model_name and int(meta.get('n_items', -1)) == len(texts):
-                emb = np.load(path_npy, mmap_mode='r')
-                return np.array(emb)
-        except Exception:
-            pass
-
-    # Compute and (optionally) save
-    emb = model_bert.encode(texts, show_progress_bar=False)
-    if use_disk_cache:
-        try:
-            np.save(path_npy, emb)
-            with open(path_meta, 'w') as f:
-                json.dump({'model': model_name, 'n_items': int(len(texts)), 'hash': key}, f)
-        except Exception as e:
-            st.warning(f"Could not persist embeddings cache: {e}")
+    cache_path = os.path.join(cache_dir, f"emb_{cache_key}.npy")
+    
+    if os.path.exists(cache_path):
+        return np.load(cache_path)
+    
+    emb = model_bert.encode(texts, show_progress_bar=True)
+    np.save(cache_path, emb)
     return emb
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def topk_similar_items(item_sim_matrix: np.ndarray, i_idx: int, k: int = 10) -> List[int]:
-    # Validate matrix
-    if item_sim_matrix is None:
-        raise ValueError("Similarity matrix is None")
-    if item_sim_matrix.ndim == 1:
-        # Expand degenerate vector to 2D if possible
-        item_sim_matrix = np.atleast_2d(item_sim_matrix)
-    n_items = item_sim_matrix.shape[0]
-    if item_sim_matrix.shape[0] != item_sim_matrix.shape[1]:
-        raise ValueError(f"Similarity matrix is not square: {item_sim_matrix.shape}")
-    if i_idx < 0 or i_idx >= n_items:
-        raise IndexError(f"i_idx {i_idx} out of bounds for similarity matrix with n_items={n_items}")
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+def get_user_history(interactions_df, items_df, u_idx, limit=10):
+    """Récupère l'historique de lecture d'un utilisateur"""
+    user_ints = interactions_df[interactions_df['u_idx'] == u_idx].sort_values('t', ascending=False)
+    if len(user_ints) == 0:
+        return pd.DataFrame()
+    
+    history = user_ints.merge(items_df[['i_idx', 'Title', 'Author']], on='i_idx', how='left')
+    return history[['Title', 'Author']].head(limit)
 
-    # Work on a copy of the selected row
-    row = np.array(item_sim_matrix[i_idx]).ravel()
-    # Avoid self (set to -inf)
-    if i_idx < row.size:
-        row[i_idx] = -1e9
-    # Limit K to available neighbors
-    k_eff = max(1, min(int(k), row.size))
-    k_eff = min(k_eff, row.size)  # safety
-    # If fewer than k neighbors exist, argpartition handles it; just slice
-    idx = np.argpartition(row, -k_eff)[-k_eff:]
-    return idx[np.argsort(row[idx])[::-1]].tolist()
+def explain_recommendation(item_row, user_history_titles, model_type="hybrid"):
+    """Génère une explication pour une recommandation"""
+    title = str(item_row.get('Title', ''))
+    author = str(item_row.get('Author', ''))
+    subjects = str(item_row.get('Subjects', ''))
+    
+    reasons = []
+    
+    # Check if same author in history
+    if author and any(author.lower() in str(h).lower() for h in user_history_titles):
+        reasons.append(f"📖 Vous avez déjà lu des livres de **{author}**")
+    
+    # Check subjects overlap
+    if 'fiction' in subjects.lower():
+        reasons.append("🎭 Correspond à vos goûts en fiction")
+    if 'science' in subjects.lower():
+        reasons.append("🔬 Thématique scientifique que vous appréciez")
+    if 'history' in subjects.lower() or 'histoire' in subjects.lower():
+        reasons.append("📜 Sujet historique dans vos centres d'intérêt")
+    
+    if not reasons:
+        reasons.append("✨ Recommandé par notre algorithme hybride (similarité sémantique + comportementale)")
+    
+    return " • ".join(reasons)
 
+def create_gauge_chart(value, title, max_val=1.0):
+    """Crée un graphique jauge pour les métriques"""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={'text': title, 'font': {'size': 16}},
+        gauge={
+            'axis': {'range': [0, max_val], 'tickwidth': 1},
+            'bar': {'color': "#667eea"},
+            'bgcolor': "white",
+            'steps': [
+                {'range': [0, max_val*0.5], 'color': '#f0f0f0'},
+                {'range': [max_val*0.5, max_val*0.75], 'color': '#e0e0e0'},
+                {'range': [max_val*0.75, max_val], 'color': '#d0d0d0'}
+            ],
+        }
+    ))
+    fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20))
+    return fig
 
-def build_item_similarity_from_model(model: SemanticHybridRecommender) -> np.ndarray:
-    # Average item_matrix across ensemble models using their weights
-    mats = []
-    weights = []
-    for m in model.ensemble_models:
-        mats.append(m['item_matrix'])
-        weights.append(m['weight'])
-    if not mats:
-        return np.zeros((model.n_items, model.n_items), dtype=float)
-    # Some may be sparse
-    acc = None
-    for w, mat in zip(weights, mats):
-        if sparse.issparse(mat):
-            mat = mat.toarray()
-        if acc is None:
-            acc = w * mat
-        else:
-            acc += w * mat
-    return acc
-
-
-def recommend_for_user(model: SemanticHybridRecommender, u_idx: int, k: int = 10) -> List[int]:
-    preds = model.predict(k=k, batch_size=max(1000, k))
-    return preds[u_idx].tolist()
-
-
-def fallback_popular(interactions: pd.DataFrame, k: int = 10) -> List[int]:
-    top = interactions['i_idx'].value_counts().head(k).index.tolist()
-    return top
-
-
-def save_feedback(log_path: str, payload: dict):
+def save_feedback(user_id, item_id, liked):
+    """Sauvegarde le feedback utilisateur"""
     try:
-        df = pd.DataFrame([payload])
-        if os.path.exists(log_path):
-            df.to_csv(log_path, mode='a', header=False, index=False)
+        feedback = {
+            'timestamp': datetime.now().isoformat(),
+            'user_id': user_id,
+            'item_id': item_id,
+            'liked': liked
+        }
+        df = pd.DataFrame([feedback])
+        if os.path.exists(FEEDBACK_LOG):
+            df.to_csv(FEEDBACK_LOG, mode='a', header=False, index=False)
         else:
-            df.to_csv(log_path, index=False)
-    except Exception as e:
-        st.error(f"Failed to save feedback: {e}")
+            df.to_csv(FEEDBACK_LOG, index=False)
+        return True
+    except:
+        return False
 
-# -----------------------------
-# Sidebar — configuration
-# -----------------------------
-st.sidebar.header("Configuration")
-path_inter = st.sidebar.text_input("Path — interactions_train.csv", os.path.join(DATA_DIR_DEFAULT, 'interactions_train.csv'))
-use_enriched = st.sidebar.toggle("Use enriched items (LLM) (-0.1% lower score and slow)", value=False)
-path_items = st.sidebar.text_input(
-    "Path — items.csv",
-    os.path.join(DATA_DIR_DEFAULT, 'items_enriched_ai_turbo.csv' if use_enriched else 'items.csv')
-)
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+with st.sidebar:
+    st.image("https://img.icons8.com/clouds/200/book-shelf.png", width=100)
+    st.title("⚙️ Configuration")
+    
+    st.markdown("---")
+    
+    # Data paths
+    st.subheader("📁 Données")
+    path_inter = os.path.join(DATA_DIR, 'interactions_train.csv')
+    path_items = os.path.join(DATA_DIR, 'items.csv')
+    
+    use_enriched = st.toggle("Utiliser métadonnées enrichies (IA)", value=False)
+    if use_enriched:
+        path_items = os.path.join(DATA_DIR, 'items_enriched_ai_turbo.csv')
+    
+    st.markdown("---")
+    
+    # Model parameters
+    st.subheader("🎛️ Paramètres du Modèle")
+    alpha = st.slider("Alpha (Collab ↔ Sémantique)", 0.0, 1.0, 0.5, 0.05,
+                      help="0 = 100% sémantique, 1 = 100% collaboratif")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        hl_short = st.number_input("Demi-vie court (j)", 1, 30, 1)
+    with col2:
+        hl_long = st.number_input("Demi-vie long (j)", 50, 500, 250)
+    
+    k_top = st.slider("Nombre de recommandations", 5, 30, 10)
+    
+    st.markdown("---")
+    
+    # Actions
+    if st.button("🔄 Reconstruire le modèle", use_container_width=True):
+        build_model.clear()
+        st.rerun()
+    
+    if st.button("🗑️ Vider le cache", use_container_width=True):
+        load_data.clear()
+        build_model.clear()
+        compute_embeddings.clear()
+        st.success("Cache vidé !")
 
-alpha = st.sidebar.slider("Alpha (collab vs content)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-hl_str = st.sidebar.text_input("Half-life days (comma-separated)", value="1,250")
+# =============================================================================
+# LOAD DATA & MODEL
+# =============================================================================
 try:
-    half_life_days = [int(x.strip()) for x in hl_str.split(',') if x.strip()]
-    if len(half_life_days) == 0:
-        half_life_days = [1, 250]
-except Exception:
-    half_life_days = [1, 250]
+    loader, interactions_df, items_df = load_data(path_inter, path_items)
+except Exception as e:
+    st.error(f"❌ Erreur de chargement des données : {e}")
+    st.info("Vérifiez que les fichiers CSV sont présents dans le dossier `data/`")
+    st.stop()
 
-k_top = st.sidebar.slider("Top-K", min_value=5, max_value=50, value=10, step=1)
-use_disk_cache = st.sidebar.toggle("Use disk cache for embeddings", value=True, help="Saves/loads S-BERT item embeddings under data/cache to speed up runs.")
-refit = st.sidebar.button("Rebuild model (fit)")
-clear_caches = st.sidebar.button("Clear in-memory caches")
-clear_disk_cache = st.sidebar.button("Clear embedding disk cache")
-
-if clear_caches:
-    load_data.clear()
-    build_model_cached.clear()
-    compute_item_embeddings.clear()
-    st.sidebar.success("In-memory caches cleared.")
-
-if clear_disk_cache:
-    cache_dir = os.path.join(PROJECT_ROOT, 'data', 'cache')
-    removed = 0
-    try:
-        if os.path.isdir(cache_dir):
-            for name in os.listdir(cache_dir):
-                if name.startswith('embeddings_') and (name.endswith('.npy') or name.endswith('.json')):
-                    try:
-                        os.remove(os.path.join(cache_dir, name))
-                        removed += 1
-                    except Exception:
-                        pass
-        st.sidebar.success(f"Removed {removed} cached files from {cache_dir}")
-    except Exception as e:
-        st.sidebar.error(f"Failed to clear disk cache: {e}")
-
-# -----------------------------
-# Load data
-# -----------------------------
-st.title(APP_TITLE)
-
-with st.spinner("Loading data..."):
-    try:
-        loader, interactions_df, items_df = load_data(path_inter, path_items)
-        st.success(f"Loaded {len(interactions_df):,} interactions, {len(items_df):,} items.")
-    except Exception as e:
-        st.error(f"Failed to load data: {e}")
-        st.stop()
-
-# -----------------------------
-# Fit / load model
-# -----------------------------
-model_key = json.dumps({
-    'alpha': alpha,
-    'hl': half_life_days,
-    'n_users': loader.n_users,
-    'n_items': loader.n_items,
-    'paths': [os.path.abspath(path_inter), os.path.abspath(path_items)]
-})
-
-if refit:
-    build_model_cached.clear()
-
-with st.spinner("Fitting model (first time may take a few minutes for BERT)..."):
-    model = build_model_cached(
+with st.spinner("🧠 Chargement du modèle Super-Ensemble..."):
+    model = build_model(
         interactions=loader.get_full_data(),
         items_df=items_df,
         n_users=loader.n_users,
         n_items=loader.n_items,
         alpha=alpha,
-        half_life_days=half_life_days,
-        ensemble_weights=None
+        half_life_days=[hl_short, hl_long]
     )
 
-# Precompute helpers
-item_sim_matrix = build_item_similarity_from_model(model)
-
-# For cold-start semantic search
-try:
-    item_emb = compute_item_embeddings(items_df, use_disk_cache=use_disk_cache)
+# Compute embeddings for semantic search
+item_emb = compute_embeddings(items_df)
+if item_emb is not None:
     item_emb_norm = item_emb / (np.linalg.norm(item_emb, axis=1, keepdims=True) + 1e-12)
-except Exception:
-    item_emb = None
+else:
     item_emb_norm = None
 
-# -----------------------------
-# Tabs / Pages
-# -----------------------------
-main_tab, user_tab, cold_tab, similar_tab, analytics_tab, settings_tab = st.tabs([
-    "Overview", "Recommend for Patron", "Cold-Start (Text Search)", "Similar Books", "Analytics", "Settings"
+# =============================================================================
+# MAIN CONTENT
+# =============================================================================
+
+# Header
+st.markdown("""
+<div class="main-header">
+    <h1>📚 BiblioRec — Système de Recommandation Intelligent</h1>
+    <p>Propulsé par le Super-Ensemble : S-BERT + Collaboratif + Séquentiel + SVD + BM25</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Tabs
+tab_home, tab_patron, tab_discover, tab_similar, tab_stats, tab_about = st.tabs([
+    "🏠 Accueil",
+    "👤 Recommander à un Usager",
+    "🔍 Découverte (Cold Start)",
+    "📖 Livres Similaires",
+    "📊 Statistiques",
+    "ℹ️ À Propos"
 ])
 
-with main_tab:
-    st.subheader("Welcome !")
-    st.markdown(
-        """
-        This app showcases the final Semantic Hybrid recommender used in our academic project:
-        - Time-decayed collaborative profiles + S-BERT content similarity
-        - Decoupled re-buy boost and light popularity prior
-        - Tunable `alpha` and half-lives to balance recent vs long-term preferences
-        """
-    )
-
-    col1, col2, col3 = st.columns(3)
+# =============================================================================
+# TAB: ACCUEIL
+# =============================================================================
+with tab_home:
+    st.header("Tableau de Bord")
+    
+    # KPIs
+    col1, col2, col3, col4 = st.columns(4)
+    
     with col1:
-        st.metric("Users", f"{loader.n_users:,}")
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{loader.n_users:,}</h3>
+            <p>👥 Usagers actifs</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col2:
-        st.metric("Items", f"{loader.n_items:,}")
+        st.markdown(f"""
+        <div class="metric-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            <h3>{loader.n_items:,}</h3>
+            <p>📚 Livres au catalogue</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col3:
-        st.metric("Interactions", f"{len(interactions_df):,}")
-
+        st.markdown(f"""
+        <div class="metric-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+            <h3>{len(interactions_df):,}</h3>
+            <p>📖 Emprunts enregistrés</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        avg_per_user = len(interactions_df) / loader.n_users
+        st.markdown(f"""
+        <div class="metric-card" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">
+            <h3>{avg_per_user:.1f}</h3>
+            <p>📈 Emprunts/usager (moy.)</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
     st.markdown("---")
-    st.markdown("### Quick catalog search")
-    q = st.text_input("Title / Author / Subject contains", "")
-    n_show = st.slider("Max rows", 5, 200, 20)
-    if q:
-        ql = q.lower()
-        def contains(s):
-            try:
-                return ql in str(s).lower()
-            except Exception:
-                return False
-        mask = items_df['Title'].apply(contains) | items_df.get('Author', '').apply(contains) | items_df.get('Subjects', '').apply(contains)
-        st.dataframe(items_df.loc[mask, ['i', 'Title', 'Author', 'Subjects']].head(n_show), use_container_width=True)
-    else:
-        st.dataframe(items_df[['i', 'Title', 'Author', 'Subjects']].head(n_show), use_container_width=True)
-
-with user_tab:
-    st.subheader("Recommendations for a known patron")
-    user_id = st.selectbox("Select user_id", options=loader.u_unique)
-    u_idx = loader.u_map[user_id]
-
-    exclude_read = st.checkbox("Exclude already borrowed (may lower MAP@K)", value=False)
-    max_per_author = st.number_input("Max per author in Top-K (0 for no limit)", min_value=0, max_value=10, value=0, step=1)
-
-    if st.button("Recommend", type='primary'):
-        with st.spinner("Scoring..."):
-            indices = recommend_for_user(model, u_idx, k=k_top)
-            recs = items_df.set_index('i_idx').loc[indices].copy()
-            recs['score_rank'] = range(1, len(recs) + 1)
-
-            # Apply business rules
-            if exclude_read:
-                history_items = interactions_df[interactions_df['u_idx'] == u_idx]['i_idx'].unique().tolist()
-                recs = recs[~recs.index.isin(history_items)]
-
-            if max_per_author > 0 and 'Author' in recs.columns:
-                recs = recs.groupby('Author', group_keys=False).head(max_per_author)
-
-        st.write("Top recommendations:")
-        st.dataframe(recs.reset_index()[['score_rank', 'i', 'Title', 'Author', 'Subjects']].head(k_top), use_container_width=True)
-
-        # Download
-        csv_buf = io.StringIO()
-        out_df = recs.reset_index()[['i', 'Title', 'Author', 'Subjects']].head(k_top)
-        out_df.to_csv(csv_buf, index=False)
-        st.download_button("Download CSV", data=csv_buf.getvalue(), file_name=f"recs_user_{user_id}.csv", mime='text/csv')
-
-        # Feedback
-        st.markdown("### Feedback")
-        fb_cols = st.columns(len(recs.head(k_top)))
-        for col, (idx, row) in zip(fb_cols, recs.head(k_top).iterrows()):
-            with col:
-                liked = st.toggle(f"👍 {row.get('Title', 'Item')}\n({row.get('Author', '')})", key=f"fb_{user_id}_{int(idx)}")
-                if liked:
-                    save_feedback(FEEDBACK_LOG, {
-                        'ts': int(time.time()),
-                        'user_id': user_id,
-                        'i': int(row.get('i', -1)),
-                        'i_idx': int(idx),
-                        'title': row.get('Title', ''),
-                        'author': row.get('Author', ''),
-                        'like': 1
-                    })
-
-with cold_tab:
-    st.subheader("Cold-start patron: describe interests")
-    st.caption("Enter keywords, a short description, or paste a book title and author.")
-    query = st.text_area("Interests", placeholder="e.g., space exploration, Asimov, robots, classic sci-fi")
-    if st.button("Find similar books"):
-        if item_emb_norm is None:
-            st.error("Semantic encoder not available. Install sentence-transformers.")
+    
+    # Quick search
+    col_search, col_results = st.columns([1, 2])
+    
+    with col_search:
+        st.subheader("🔎 Recherche Rapide")
+        search_query = st.text_input("Titre, auteur ou sujet...", placeholder="Ex: Harry Potter")
+        n_results = st.slider("Résultats max", 5, 50, 20)
+    
+    with col_results:
+        if search_query:
+            q = search_query.lower()
+            mask = (
+                items_df['Title'].str.lower().str.contains(q, na=False) |
+                items_df['Author'].fillna('').str.lower().str.contains(q, na=False) |
+                items_df['Subjects'].fillna('').str.lower().str.contains(q, na=False)
+            )
+            results = items_df[mask][['i', 'Title', 'Author', 'Subjects']].head(n_results)
+            
+            if len(results) > 0:
+                st.dataframe(results, use_container_width=True, hide_index=True)
+            else:
+                st.info("Aucun résultat trouvé.")
         else:
-            with st.spinner("Encoding query and ranking..."):
-                bert = load_bert()
-                q_vec = bert.encode([query], show_progress_bar=False)
-                q_vec = q_vec / (np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-12)
-                sims = (q_vec @ item_emb_norm.T).ravel()
-                idx = np.argpartition(sims, -k_top)[-k_top:]
-                idx = idx[np.argsort(sims[idx])[::-1]]
-                recs = items_df.set_index('i_idx').loc[idx]
-                st.dataframe(recs.reset_index()[['i', 'Title', 'Author', 'Subjects']].head(k_top), use_container_width=True)
+            st.subheader("📚 Derniers ajouts au catalogue")
+            st.dataframe(
+                items_df[['i', 'Title', 'Author']].tail(10).iloc[::-1],
+                use_container_width=True,
+                hide_index=True
+            )
 
-with similar_tab:
-    st.subheader("Similar books (item-item)")
-    # Select by title substring to pick an item
-    title_q = st.text_input("Type title to search", "")
-    candidates = items_df[items_df['Title'].str.contains(title_q, case=False, na=False)].head(50)
-    if len(candidates) == 0:
-        st.info("No matching titles yet.")
-    else:
-        picked = st.selectbox("Pick a book", options=list(candidates['Title'] + '  —  #' + candidates['i'].astype(str)))
-        # parse item id at the end
-        try:
-            picked_i = int(picked.split('#')[-1])
-            match = items_df[items_df['i'] == picked_i]
-            if match.empty or 'i_idx' not in match.columns:
-                raise ValueError("Selected item not found or not aligned (missing i_idx). Reload data or check items file.")
-            i_idx = int(match['i_idx'].iloc[0])
+# =============================================================================
+# TAB: RECOMMANDER À UN USAGER
+# =============================================================================
+with tab_patron:
+    st.header("👤 Recommandations Personnalisées")
+    
+    col_user, col_options = st.columns([1, 1])
+    
+    with col_user:
+        st.subheader("Sélectionner un usager")
+        
+        # User selection with search
+        user_search = st.text_input("🔍 Rechercher par ID", "")
+        
+        if user_search:
+            filtered_users = [u for u in loader.u_unique if str(user_search) in str(u)][:100]
+        else:
+            filtered_users = loader.u_unique[:100]
+        
+        selected_user = st.selectbox(
+            "ID Usager",
+            options=filtered_users,
+            format_func=lambda x: f"Usager #{x}"
+        )
+        u_idx = loader.u_map[selected_user]
+    
+    with col_options:
+        st.subheader("Options")
+        exclude_read = st.checkbox("📕 Exclure les livres déjà empruntés", value=True)
+        max_per_author = st.number_input("📚 Max par auteur (0 = illimité)", 0, 5, 2)
+        show_explanations = st.checkbox("💡 Afficher les explications", value=True)
+    
+    st.markdown("---")
+    
+    # User history
+    col_history, col_recs = st.columns([1, 2])
+    
+    with col_history:
+        st.subheader("📖 Historique de l'usager")
+        history = get_user_history(interactions_df, items_df, u_idx, limit=8)
+        
+        if len(history) > 0:
+            for _, row in history.iterrows():
+                st.markdown(f"""
+                <div style="background: #f8f9fa; padding: 0.5rem 1rem; border-radius: 8px; margin: 0.3rem 0; border-left: 3px solid #667eea;">
+                    <strong>{row['Title'][:40]}{'...' if len(str(row['Title'])) > 40 else ''}</strong><br>
+                    <small style="color: #666;">{row['Author']}</small>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Aucun historique disponible.")
+    
+    with col_recs:
+        st.subheader("✨ Recommandations")
+        
+        if st.button("🎯 Générer les recommandations", type="primary", use_container_width=True):
+            with st.spinner("Calcul en cours..."):
+                # Get predictions
+                preds = model.predict(k=k_top * 2, batch_size=1000)
+                indices = preds[u_idx].tolist()
+                
+                # Build recommendations dataframe
+                recs = items_df.set_index('i_idx').loc[indices].copy()
+                
+                # Apply filters
+                if exclude_read:
+                    read_items = interactions_df[interactions_df['u_idx'] == u_idx]['i_idx'].unique()
+                    recs = recs[~recs.index.isin(read_items)]
+                
+                if max_per_author > 0 and 'Author' in recs.columns:
+                    recs = recs.groupby('Author', group_keys=False).head(max_per_author)
+                
+                recs = recs.head(k_top)
+                
+                # Get user history titles for explanations
+                history_titles = history['Title'].tolist() if len(history) > 0 else []
+                
+                # Display recommendations
+                for rank, (idx, row) in enumerate(recs.iterrows(), 1):
+                    with st.container():
+                        cols = st.columns([0.5, 4, 1])
+                        
+                        with cols[0]:
+                            st.markdown(f"### #{rank}")
+                        
+                        with cols[1]:
+                            st.markdown(f"**{row['Title']}**")
+                            st.markdown(f"*{row.get('Author', 'Auteur inconnu')}*")
+                            
+                            if show_explanations:
+                                reason = explain_recommendation(row, history_titles)
+                                st.markdown(f"""
+                                <div class="book-reason">{reason}</div>
+                                """, unsafe_allow_html=True)
+                        
+                        with cols[2]:
+                            if st.button("👍", key=f"like_{idx}"):
+                                save_feedback(selected_user, idx, True)
+                                st.success("Merci !")
+                        
+                        st.markdown("---")
+                
+                # Download button
+                csv_buf = io.StringIO()
+                recs.reset_index()[['i', 'Title', 'Author']].to_csv(csv_buf, index=False)
+                st.download_button(
+                    "📥 Télécharger la liste (CSV)",
+                    data=csv_buf.getvalue(),
+                    file_name=f"recommandations_usager_{selected_user}.csv",
+                    mime="text/csv"
+                )
 
-            # Guard: ensure similarity matrix is valid and K is feasible
-            if item_sim_matrix is None:
-                raise ValueError("Similarity matrix is not available")
-            n_items_sim = item_sim_matrix.shape[0] if hasattr(item_sim_matrix, 'shape') else 0
-            if n_items_sim <= 1:
-                raise ValueError("Not enough items to compute neighbors (<=1)")
-            k_eff = max(1, min(int(k_top), n_items_sim - 1))
+# =============================================================================
+# TAB: DÉCOUVERTE (COLD START)
+# =============================================================================
+with tab_discover:
+    st.header("🔍 Découverte — Nouvel Usager")
+    
+    st.markdown("""
+    <div class="info-box">
+        <strong>💡 Mode Cold Start</strong><br>
+        Pour les nouveaux usagers sans historique, décrivez leurs goûts en quelques mots.
+        Notre modèle S-BERT trouvera les livres les plus pertinents.
+    </div>
+    """, unsafe_allow_html=True)
+    
+    query = st.text_area(
+        "Décrivez les intérêts de l'usager",
+        placeholder="Ex: Romans policiers nordiques, enquêtes psychologiques, ambiance sombre...",
+        height=100
+    )
+    
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("🔮 Trouver des livres", type="primary", use_container_width=True):
+            if item_emb_norm is None:
+                st.error("Le modèle sémantique n'est pas disponible.")
+            elif not query.strip():
+                st.warning("Veuillez entrer une description.")
+            else:
+                with st.spinner("Analyse sémantique en cours..."):
+                    bert = load_bert()
+                    q_vec = bert.encode([query])
+                    q_vec = q_vec / (np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-12)
+                    
+                    sims = (q_vec @ item_emb_norm.T).ravel()
+                    top_idx = np.argsort(sims)[-k_top:][::-1]
+                    
+                    st.session_state['cold_results'] = items_df.set_index('i_idx').loc[top_idx]
+    
+    with col2:
+        if 'cold_results' in st.session_state:
+            results = st.session_state['cold_results']
+            
+            for _, row in results.iterrows():
+                st.markdown(f"""
+                <div class="book-card">
+                    <div class="book-title">{row['Title']}</div>
+                    <div class="book-author">{row.get('Author', '')}</div>
+                    <div style="font-size: 0.8rem; color: #888; margin-top: 0.5rem;">
+                        {str(row.get('Subjects', ''))[:100]}...
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-            neighbors = topk_similar_items(item_sim_matrix, i_idx, k=k_eff)
-            # Some neighbors might be missing in the items index (shouldn't happen, but guard anyway)
-            items_by_idx = items_df.set_index('i_idx')
-            neighbors_in = [n for n in neighbors if n in items_by_idx.index]
-            if len(neighbors_in) == 0:
-                raise ValueError("No neighbor indices found in items table")
-            recs = items_by_idx.loc[neighbors_in]
-            st.dataframe(recs.reset_index()[['i', 'Title', 'Author', 'Subjects']].head(k_eff), use_container_width=True)
-        except Exception as e:
-            st.error(f"Failed to compute similar items: {e}")
+# =============================================================================
+# TAB: LIVRES SIMILAIRES
+# =============================================================================
+with tab_similar:
+    st.header("📖 Trouver des Livres Similaires")
+    
+    search_title = st.text_input("🔍 Rechercher un livre par titre", "")
+    
+    if search_title:
+        matches = items_df[items_df['Title'].str.contains(search_title, case=False, na=False)].head(20)
+        
+        if len(matches) > 0:
+            selected_book = st.selectbox(
+                "Sélectionner le livre",
+                options=matches['Title'].tolist(),
+                format_func=lambda x: x[:60] + "..." if len(x) > 60 else x
+            )
+            
+            if st.button("🔗 Trouver des livres similaires", type="primary"):
+                book_row = matches[matches['Title'] == selected_book].iloc[0]
+                i_idx = book_row['i_idx']
+                
+                # Use semantic similarity
+                if item_emb_norm is not None:
+                    book_vec = item_emb_norm[i_idx:i_idx+1]
+                    sims = (book_vec @ item_emb_norm.T).ravel()
+                    sims[i_idx] = -1  # Exclude self
+                    
+                    top_idx = np.argsort(sims)[-k_top:][::-1]
+                    similar = items_df.set_index('i_idx').loc[top_idx]
+                    
+                    st.subheader(f"Livres similaires à « {selected_book[:50]}... »")
+                    
+                    cols = st.columns(2)
+                    for i, (_, row) in enumerate(similar.iterrows()):
+                        with cols[i % 2]:
+                            st.markdown(f"""
+                            <div class="book-card">
+                                <div class="book-title">{row['Title']}</div>
+                                <div class="book-author">{row.get('Author', '')}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+        else:
+            st.info("Aucun livre trouvé avec ce titre.")
 
-with analytics_tab:
-    st.subheader("Collection & usage snapshots")
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.metric("Unique patrons", f"{loader.n_users:,}")
-    with colB:
-        st.metric("Unique books", f"{loader.n_items:,}")
-    with colC:
-        top_pop = fallback_popular(interactions_df, k=5)
-        st.metric("Top popular (i_idx)", ", ".join(map(str, top_pop)))
+# =============================================================================
+# TAB: STATISTIQUES
+# =============================================================================
+with tab_stats:
+    st.header("📊 Statistiques de la Bibliothèque")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📚 Top 15 Auteurs les plus empruntés")
+        
+        merged = interactions_df.merge(items_df[['i_idx', 'Author']], on='i_idx', how='left')
+        top_authors = merged['Author'].fillna('Inconnu').value_counts().head(15)
+        
+        fig = px.bar(
+            x=top_authors.values,
+            y=top_authors.index,
+            orientation='h',
+            labels={'x': 'Nombre d\'emprunts', 'y': 'Auteur'},
+            color=top_authors.values,
+            color_continuous_scale='Blues'
+        )
+        fig.update_layout(showlegend=False, height=400, yaxis={'categoryorder': 'total ascending'})
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        st.subheader("📈 Distribution des emprunts par usager")
+        
+        user_counts = interactions_df.groupby('u_idx').size()
+        
+        fig = px.histogram(
+            user_counts,
+            nbins=50,
+            labels={'value': 'Nombre d\'emprunts', 'count': 'Nombre d\'usagers'},
+            color_discrete_sequence=['#667eea']
+        )
+        fig.update_layout(showlegend=False, height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Sparsity gauge
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        sparsity = 1 - (len(interactions_df) / (loader.n_users * loader.n_items))
+        fig = create_gauge_chart(sparsity * 100, "Sparsité (%)", 100)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        coverage = len(interactions_df['i_idx'].unique()) / loader.n_items
+        fig = create_gauge_chart(coverage * 100, "Couverture Catalogue (%)", 100)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col3:
+        active_users = len(interactions_df['u_idx'].unique()) / loader.n_users
+        fig = create_gauge_chart(active_users * 100, "Usagers Actifs (%)", 100)
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Top authors by interactions")
-    if 'Author' in items_df.columns:
-        merged = interactions_df.merge(items_df[['i', 'i_idx', 'Author']], on=['i', 'i_idx'], how='left')
-        top_auth = merged['Author'].fillna('Unknown').value_counts().head(20)
-        st.bar_chart(top_auth)
-    else:
-        st.info("Author column not available in items.")
-
-    st.markdown("#### Recency histogram (per-user rank pct)")
-    if 'rank' not in interactions_df.columns:
-        tmp = interactions_df.sort_values(['u_idx', 't']).copy()
-        interactions_df = interactions_df.copy()
-        interactions_df['rank'] = tmp.groupby('u_idx')['t'].rank(pct=True, method='dense')
-    # Draw histogram using numpy and st.bar_chart
-    hist_counts, bin_edges = np.histogram(interactions_df['rank'].astype(float).fillna(0.0), bins=30, range=(0.0, 1.0))
-    hist_df = pd.DataFrame({
-        'bin': pd.IntervalIndex.from_breaks(bin_edges).astype(str),
-        'count': hist_counts
-    })
-    hist_df = hist_df.set_index('bin')
-    st.bar_chart(hist_df)
-
-with settings_tab:
-    st.subheader("Settings & Utilities")
-    st.write("Paths:")
-    st.code(f"interactions: {path_inter}\nitems: {path_items}")
-
-    st.write("Export sample submission (warm users only)")
-    if st.button("Generate CSV preview"):
-        with st.spinner("Predicting for all known users (preview)..."):
-            preds = model.predict(k=k_top, batch_size=1000)
-            out = []
-            for uid in loader.u_unique[:1000]:  # limit preview
-                u_idx = loader.u_map[uid]
-                pred_items = [str(loader.idx_to_i[i]) for i in preds[u_idx]]
-                out.append({'user_id': uid, 'recommendation': ' '.join(pred_items)})
-            df_out = pd.DataFrame(out)
-            csv_buf = io.StringIO()
-            df_out.to_csv(csv_buf, index=False)
-            st.download_button("Download preview CSV", data=csv_buf.getvalue(), file_name="submission_preview.csv", mime='text/csv')
-
-st.caption("© 2025 Library Recommender Demo — Streamlit UI. This demo reads local CSVs; see README for details.")
+# =============================================================================
+# TAB: À PROPOS
+# =============================================================================
+with tab_about:
+    st.header("ℹ️ À Propos du Système")
+    
+    st.markdown("""
+    ### 🧠 Architecture Super-Ensemble
+    
+    Ce système de recommandation combine **5 signaux complémentaires** pour des recommandations précises :
+    
+    | Signal | Technologie | Description |
+    |--------|-------------|-------------|
+    | **Sémantique** | S-BERT | Comprend le sens des titres et sujets |
+    | **Collaboratif** | TF-IDF + Time-Decay | Apprend des comportements similaires |
+    | **Séquentiel** | Co-visitation | Prédit le prochain livre (séries) |
+    | **Latent** | SVD | Capture les patterns cachés |
+    | **Lexical** | BM25 | Correspondance exacte de mots-clés |
+    
+    ---
+    
+    ### 🏆 Performance
+    
+    - **Score MAP@10** : 0.21181
+    - **Classement Kaggle** : 1ère place
+    
+    ---
+    
+    ### 👥 Équipe
+    
+    **Master TIDE — Université Paris 1 Panthéon-Sorbonne**
+    
+    - **Sacha Jocic** — Architecture & Tuning
+    - **Léa Jouffrey** — Data Science & UX
+    - **Saloua Dekhissi** — Sémantique & Documentation
+    
+    ---
+    
+    ### 📚 Utilisation pour Bibliothécaires
+    
+    1. **Recommander à un usager** : Sélectionnez un usager existant pour voir ses recommandations personnalisées
+    2. **Découverte** : Pour les nouveaux usagers, décrivez leurs goûts en texte libre
+    3. **Livres similaires** : Trouvez des alternatives à un livre spécifique
+    4. **Statistiques** : Analysez les tendances de votre collection
+    """)
+    
+    st.markdown("---")
+    st.caption("© 2025 BiblioRec — Projet Académique Master TIDE")

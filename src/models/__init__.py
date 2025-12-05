@@ -10,5 +10,6 @@ from .experimental import (
     HistoryFilterRecommender,     # Nouveau
     LowInteractionRecommender,
     CoupledSemanticRecommender,
-    SemanticHybridRecommenderChatGPT# Nouveau
+    SemanticHybridRecommenderChatGPT,
+    SequentialRecommender
 )
